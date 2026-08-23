@@ -1927,6 +1927,7 @@ static WebGPUFence *WEBGPU_INTERNAL_CreateFenceFromFuture(WGPUFuture future)
     return fence;
 }
 
+#ifndef __EMSCRIPTEN__
 static void WEBGPU_INTERNAL_ReregisterFence(WGPUQueue queue, WebGPUFence *fence)
 {
     if (fence == NULL) {
@@ -1942,6 +1943,7 @@ static void WEBGPU_INTERNAL_ReregisterFence(WGPUQueue queue, WebGPUFence *fence)
                                                                    .userdata2 = NULL,
                                                                });
 }
+#endif
 
 static bool WEBGPU_INTERNAL_QueryFence(WebGPURenderer *renderer, WebGPUFence *fence)
 {
@@ -3498,7 +3500,14 @@ static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, 
 
     // Device-lost callbacks use AllowProcessEvents so their renderer userdata
     // cannot be invoked concurrently with device destruction.
+#ifndef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(cmdBuf->renderer->instance);
+#endif
+    // Reap completed submissions before enforcing the frames-in-flight limit.
+    // This is required by nonblocking browser loops, which deliberately use
+    // SDL_AcquireGPUSwapchainTexture instead of sleeping inside the blocking
+    // helper and therefore would not otherwise run this maintenance step.
+    WEBGPU_INTERNAL_HandlePendingDestroys(cmdBuf->renderer);
 
     if (cmdBuf->renderer->submittedCommandBufferCount >= cmdBuf->renderer->maxFramesInFlight) {
         *swapchainTexture = NULL;
@@ -5534,6 +5543,17 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
         return false;
     }
 
+#ifdef __EMSCRIPTEN__
+    // Browser WebGPU retains every JS resource referenced by a queue
+    // submission. Avoid registering Dawn futures here: Emdawn's EventManager
+    // is not re-entrant with an Asyncify-driven application loop. Keep the
+    // SDL-side usage records until the next acquire, then release their C
+    // reference counts through the normal queued-destroy path.
+    submitted = SDL_calloc(1, sizeof(*submitted));
+    *submitted = wrapper->submitted;
+    submitted->fence = NULL;
+    WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(wrapper->renderer, submitted);
+#else
     if (wrapper->renderer->queueDoneFence != NULL) {
         // Reregister the fence
         WEBGPU_INTERNAL_ReregisterFence(wrapper->queue, wrapper->renderer->queueDoneFence);
@@ -5548,6 +5568,7 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
 
     WEBGPU_INTERNAL_InsertElementIntoArray(wrapper->renderer->submittedCommandBuffers, wrapper->renderer->submittedCommandBufferCapacity,
                                            wrapper->renderer->submittedCommandBufferCount, WebGPUSubmittedCommandBuffer *, submitted);
+#endif
 
     wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
 

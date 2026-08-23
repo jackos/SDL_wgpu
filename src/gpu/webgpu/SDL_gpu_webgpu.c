@@ -34,6 +34,7 @@
 #ifdef SDL_GPU_WEBGPU
 
 #include "../SDL_sysgpu.h"
+#include "../../events/SDL_windowevents_c.h"
 #include "webgpu.h"
 
 #define WINDOW_PROPERTY_DATA                           "SDL.internal.gpu.webgpu.data"
@@ -1517,13 +1518,14 @@ static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *succes
 
 static void WEBGPU_INTERNAL_DeviceLostCallback(WGPUDevice const *device, WGPUDeviceLostReason reason, WGPUStringView message, void *renderer, void *unused)
 {
-    bool debugMode = ((WebGPURenderer *)renderer)->debugMode;
+    WebGPURenderer *webgpuRenderer = (WebGPURenderer *)renderer;
+    bool debugMode = webgpuRenderer->debugMode;
 
-    if (debugMode) {
+    if (debugMode && !webgpuRenderer->destroyingSelf) {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Device has been lost.");
     }
 
-    if (((WebGPURenderer *)renderer)->shouldRecreateLostDevice && !((WebGPURenderer *)renderer)->destroyingSelf) {
+    if (webgpuRenderer->shouldRecreateLostDevice && !webgpuRenderer->destroyingSelf) {
         // Since the device has been lost, there might be some larger issues within WebGPU.
         // We'll double check that everything's in order.
 
@@ -1791,7 +1793,7 @@ static void WEBGPU_INTERNAL_RequestDevice(WebGPURenderer *renderer, bool *succes
 
     deviceDesc.deviceLostCallbackInfo = (WGPUDeviceLostCallbackInfo){
         .callback = WEBGPU_INTERNAL_DeviceLostCallback,
-        .mode = WGPUCallbackMode_AllowSpontaneous,
+        .mode = WGPUCallbackMode_AllowProcessEvents,
         .nextInChain = NULL,
         .userdata1 = renderer,
         .userdata2 = NULL,
@@ -3419,6 +3421,30 @@ static void WEBGPU_ReleaseSampler(SDL_GPURenderer *device, SDL_GPUSampler *sampl
 static bool WEBGPU_SupportsSwapchainComposition(SDL_GPURenderer *driverData, SDL_Window *window, SDL_GPUSwapchainComposition swapchainComposition);
 static SDL_GPUTextureFormat WEBGPU_GetSwapchainTextureFormat(SDL_GPURenderer *device, SDL_Window *window);
 
+static WebGPUWindowData *WEBGPU_INTERNAL_FetchWindowData(SDL_Window *window)
+{
+    SDL_PropertiesID properties = SDL_GetWindowProperties(window);
+    return (WebGPUWindowData *)SDL_GetPointerProperty(properties, WINDOW_PROPERTY_DATA, NULL);
+}
+
+static bool WEBGPU_INTERNAL_OnWindowResize(void *userdata, SDL_Event *event)
+{
+    SDL_Window *window = (SDL_Window *)userdata;
+
+    if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
+        event->window.windowID == SDL_GetWindowID(window) &&
+        event->window.data1 > 0 && event->window.data2 > 0) {
+        WebGPUWindowData *windowData = WEBGPU_INTERNAL_FetchWindowData(window);
+        if (windowData != NULL) {
+            windowData->surfaceConfig.width = (Uint32)event->window.data1;
+            windowData->surfaceConfig.height = (Uint32)event->window.data2;
+            windowData->surfaceDirty = true;
+        }
+    }
+
+    return true;
+}
+
 static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
 {
     WebGPUWindowData *windowData;
@@ -3432,6 +3458,11 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
     windowData->swapchainComposition = SDL_GPU_SWAPCHAINCOMPOSITION_SDR;
     windowData->renderer = (WebGPURenderer *)device;
     windowData->surface = SDL_WGPU_CreateSurface(window, windowData->renderer->instance);
+    if (windowData->surface == NULL) {
+        SDL_ClearProperty(props, WINDOW_PROPERTY_DATA);
+        SDL_free(windowData);
+        return false;
+    }
     windowData->surfaceDirty = false;
     int w = 0;
     int h = 0;
@@ -3456,10 +3487,7 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
 
     wgpuSurfaceConfigure(windowData->surface, &windowData->surfaceConfig);
 
-    if (windowData->surface == NULL) {
-        // TODO: I can't be bothered freeing everything
-        return false;
-    }
+    SDL_AddWindowEventWatch(SDL_WINDOW_EVENT_WATCH_NORMAL, WEBGPU_INTERNAL_OnWindowResize, window);
 
     return true;
 }
@@ -3467,6 +3495,10 @@ static bool WEBGPU_ClaimWindow(SDL_GPURenderer *device, SDL_Window *window)
 static bool WEBGPU_AcquireSwapchainTexture(SDL_GPUCommandBuffer *commandBuffer, SDL_Window *window, SDL_GPUTexture **swapchainTexture, Uint32 *width, Uint32 *height)
 {
     WebGPUCommandBuffer *cmdBuf = (WebGPUCommandBuffer *)commandBuffer;
+
+    // Device-lost callbacks use AllowProcessEvents so their renderer userdata
+    // cannot be invoked concurrently with device destruction.
+    wgpuInstanceProcessEvents(cmdBuf->renderer->instance);
 
     if (cmdBuf->renderer->submittedCommandBufferCount >= cmdBuf->renderer->maxFramesInFlight) {
         *swapchainTexture = NULL;
@@ -4765,11 +4797,11 @@ static void WEBGPU_BeginRenderPass(SDL_GPUCommandBuffer *commandBuffer, const SD
         if (colorTargetInfos[i].store_op == SDL_GPU_STOREOP_RESOLVE || colorTargetInfos[i].store_op == SDL_GPU_STOREOP_RESOLVE_AND_STORE) {
             WebGPUTexture *resolveTexture = ((WebGPUTextureContainer *)colorTargetInfos[i].resolve_texture)->activeTexture;
 
-            colorAttachments[i].view = resolveTexture->textureViews[WEBGPU_INTERNAL_GetTextureViewIndex(
-                                                                        colorTargetInfos[i].resolve_layer,
-                                                                        colorTargetInfos[i].resolve_mip_level,
-                                                                        wgpuTextureGetMipLevelCount(resolveTexture->texture))]
-                                           ->view;
+            colorAttachments[i].resolveTarget = resolveTexture->textureViews[WEBGPU_INTERNAL_GetTextureViewIndex(
+                                                                                 colorTargetInfos[i].resolve_layer,
+                                                                                 colorTargetInfos[i].resolve_mip_level,
+                                                                                 wgpuTextureGetMipLevelCount(resolveTexture->texture))]
+                                                    ->view;
         }
     }
 
@@ -5585,9 +5617,12 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->submittingCommandBufferLock);
     SDL_DestroyMutex(renderer->creatingWebGPUResourceLock);
 
+    SDL_free(renderer->queueDoneFence);
+    wgpuDeviceDestroy(renderer->device);
+    wgpuInstanceProcessEvents(renderer->instance);
     wgpuQueueRelease(renderer->queue);
-    // FIXME: Releasing the device leaks a bunch of memory each time!!! There's 100% some resource I'm not freeing.
-    // wgpuDeviceRelease(renderer->device);
+    wgpuDeviceRelease(renderer->device);
+    wgpuInstanceProcessEvents(renderer->instance);
     wgpuAdapterRelease(renderer->adapter);
     wgpuInstanceRelease(renderer->instance);
 
@@ -5603,10 +5638,12 @@ static void WEBGPU_DestroyDevice(SDL_GPUDevice *device)
 
 static void WEBGPU_ReleaseWindow(SDL_GPURenderer *driverData, SDL_Window *window)
 {
-    WebGPUWindowData *windowData = SDL_GetPointerProperty(window->props, WINDOW_PROPERTY_DATA, NULL);
+    WebGPUWindowData *windowData = WEBGPU_INTERNAL_FetchWindowData(window);
     if (windowData == NULL) {
         return;
     }
+
+    SDL_RemoveWindowEventWatch(SDL_WINDOW_EVENT_WATCH_NORMAL, WEBGPU_INTERNAL_OnWindowResize, window);
 
     // FIXME: This should be done in the video subsystem!
     wgpuSurfaceUnconfigure(windowData->surface);

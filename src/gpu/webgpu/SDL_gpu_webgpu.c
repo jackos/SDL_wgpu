@@ -5553,7 +5553,14 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     *submitted = wrapper->submitted;
     submitted->fence = NULL;
     WEBGPU_INTERNAL_QueueSubmittedCommandBufferForRelease(wrapper->renderer, submitted);
+    wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
 #else
+    // Register completion futures after submission so they include the work
+    // that was just queued. Registering them before wgpuQueueSubmit makes an
+    // idle wait cover only the preceding submission, leaving the final frame
+    // to be drained synchronously during device destruction.
+    wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
+
     if (wrapper->renderer->queueDoneFence != NULL) {
         // Reregister the fence
         WEBGPU_INTERNAL_ReregisterFence(wrapper->queue, wrapper->renderer->queueDoneFence);
@@ -5569,8 +5576,6 @@ static bool WEBGPU_Submit(SDL_GPUCommandBuffer *commandBuffer)
     WEBGPU_INTERNAL_InsertElementIntoArray(wrapper->renderer->submittedCommandBuffers, wrapper->renderer->submittedCommandBufferCapacity,
                                            wrapper->renderer->submittedCommandBufferCount, WebGPUSubmittedCommandBuffer *, submitted);
 #endif
-
-    wgpuQueueSubmit(wrapper->queue, 1, &cmdBuf);
 
     if (isMainThread) {
 #ifndef __EMSCRIPTEN__
